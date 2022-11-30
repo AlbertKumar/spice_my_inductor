@@ -32,6 +32,19 @@ def L12(ntwk):
     return((-1/Y12).imag / (2*math.pi*f))
 
 
+def R(ntwk, p1=0, p2=1):
+    if (p1==0 and p2==0) or (p1==1 and p2==1): Ypp = ntwk.y[:, p1, p2]
+    else: Ypp = -ntwk.y[:, p1, p2]
+    return((1/Ypp).real)
+
+
+def L(ntwk, p1=0, p2=1):
+    if (p1 == 0 and p2 == 0) or (p1 == 1 and p2 == 1): Ypp = -ntwk.y[:, p1, p2]
+    else: Ypp = ntwk.y[:, p1, p2]
+    f = ntwk.frequency.f
+    return((-1/Ypp).imag / (2*math.pi*f))
+
+
 def parallel(ntwk1, ntwk2):
     '''
     Returns parallel combination of two networks.

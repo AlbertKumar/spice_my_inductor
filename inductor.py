@@ -1,13 +1,7 @@
-import math
-import numpy as np
-from matplotlib import pyplot as plt
-from skrf.media import DefinedGammaZ0
-from skrf import Network, Frequency, connect, innerconnect, mathFunctions
 from lmfit import minimize, Parameters, Model
 from pathlib import Path
 from skrf_extensions import *
 from aux import *
-
 
 """
 Inductor class.
@@ -682,7 +676,8 @@ class Inductor():
         """
         if filename is None:
             filename = "{}.cir".format(self.name)
-            path = Path(filename)
+
+        path = Path(filename)
 
         text = ("Ls0 PLUS N001 {Ls0_nH}e-9\n"
                "Rs0 N001 MINUS {Rs0_ohms}\n"
@@ -704,4 +699,16 @@ class Inductor():
 
         with open(path, mode='w') as fid:
             fid.write(text)
+
+
+    def show_plot(self, save=True):
+        """
+        Shows a plot of the inductor model vs data.
+        :param filename: If given, plots will be saved to this filename.
+        :return:
+        """
+        plotLR(self.data, self.model, plot_type='series', filename="./{}_fit_series.png".format(self.name))
+        plotLR(self.data, self.model, plot_type='in', filename="./{}_fit_in.png".format(self.name))
+        plt.show()
+
 
