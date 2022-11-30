@@ -1,5 +1,5 @@
 # spice_my_inductor
-Takes an s-parameter (Touchstone s2p) file and creates a lumped component Spice (.sp) model.
+Creates a lumped component Spice (.cir) model from a Touchstone file (.s2p) or a scikit-RF Network.
 
 1. Download the files:
   - inductor.py
