@@ -24,6 +24,9 @@ print(inductor.model_parameters)
 
 # Write out the data in spice format.
 inductor.write_spice(filename='./my_inductor.cir')
+
+# Show the model vs data.
+inductor.show_plot()
 ```
 
 References:
