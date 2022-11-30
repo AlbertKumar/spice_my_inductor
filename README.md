@@ -31,7 +31,7 @@ inductor.show_plot()
 
 Plots:
 
-![smi_inductor_fit_series](https://user-images.githubusercontent.com/56657608/204691855-6f247cbb-3774-48ff-9796-2887db88a785.png)
+![smi_inductor_fit_series](https://user-images.githubusercontent.com/56657608/204695145-f430c34d-1b4e-43fe-8417-1a507582e2eb.png)
 
 
 Generated spice file.
