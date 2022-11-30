@@ -6,13 +6,13 @@ Creates a lumped component Spice (.cir) model from a Touchstone file (.s2p) or a
   - skrf_extensions.py
   - aux.py
 
-2. Make sure you have the following installed.
+2. SMI has the following dependencies:
   - numpy
   - scikit-rf
   - lmfit
   - matplotlib
   
-Example script.
+3. Example script.
 ```
 from inductor import *
 
