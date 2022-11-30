@@ -29,7 +29,8 @@ def plotLR(ntwk1, ntwk2=None, plot_type='series', filename=None):
     ax[0].plot(f, R1, linestyle='None', marker='o', markeredgecolor='b', markersize=5, alpha=0.1)
     if ntwk2 is not None: ax[0].plot(f, R2, linestyle='--', color='k')
     ax[0].set(ylabel='R{} (ohms)'.format(plot_type))
-    ax[0].set_ylim(0.9*min(R1), 1.1*max(R1))
+    #ax[0].set_ylim(0.9*min(R1), 1.1*max(R1))
+    ax[0].set_yscale('log')
 
     ax[1].plot(f, L1, linestyle='None', marker='o', markeredgecolor='b', markersize=5, alpha=0.1)
     if ntwk2 is not None: ax[1].plot(f, L2, linestyle='--', color='k')
