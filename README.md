@@ -1,18 +1,7 @@
 # spice_my_inductor
 Creates a lumped component Spice (.cir) model from a Touchstone file (.s2p) or a scikit-RF Network.
 
-1. Download the files:
-  - inductor.py
-  - skrf_extensions.py
-  - aux.py
-
-2. SMI has the following dependencies:
-  - numpy
-  - scikit-rf
-  - lmfit
-  - matplotlib
-  
-3. Example script.
+ 1. Example script.
 ```
 from inductor import *
 
@@ -54,5 +43,16 @@ Cp PLUS MINUS 37.63844211044595
 .ends
 ```
 
-References:
+2. Installation. Download the following.
+  - inductor.py
+  - skrf_extensions.py
+  - aux.py
+
+3. Dependencies.
+  - numpy
+  - scikit-rf
+  - lmfit
+  - matplotlib
+
+4. References.
 H. -H. Chen, H. -W. Zhang, S. -J. Chung, J. -T. Kuo and T. -C. Wu, "Accurate Systematic Model-Parameter Extraction for On-Chip Spiral Inductors," in IEEE Transactions on Electron Devices, vol. 55, no. 11, pp. 3267-3273, Nov. 2008, doi: 10.1109/TED.2008.2005131.
