@@ -2,8 +2,23 @@ from lmfit import minimize, Parameters, Model
 from pathlib import Path
 from skrf_extensions import *
 from aux import *
+import time
+#from scikit_learn.metrics import r2_score
 
 """
+Status 11/30/2022: 
+    [70%] Fix get_Cox_Rsi_Csi. Use 3-variable brute force fit. Ideal fit doesn't work for real inductors.
+        bffit works better for linear step
+    [0%] Fix get_Cox_Rsi_Csi to find better (higher) value for Rsi. Z_Cox_Rsi_Csi is not matching well at lowest frequency. 
+        May be model limitation.
+    [100%] Fix bffit so that the n best combos have different min/max for each parameter. Right now, it's possible that one parameter doesn't 
+        in the best_combos is constant.
+    [0%] Add ability to handle "vary=False" in bffit.
+    [0%] Change the real + imaginary fit residuals to be % optimizations (not -).
+    [0%] Get the single-turn inductor to fit properly. --> Can't resistance rise is too rapid. Need a different model.
+    [0%] Change Cp optimization to fit SRF. --> No. Estimates at MF and optimizies up to series SRF.
+    [0%] Change Ls0_Rs0_Ls1_Rs1 to use bffit.
+
 Inductor class.
  - Holds the data to be fitted as Network object
  - Creates a fitted Network object
@@ -24,6 +39,7 @@ class Inductor():
         # Options.
         self.verbose = verbose
         self.name = name    # Name of the inductor used to write Spice, Spectre, or Xyce.
+        self.max_Rsi = 1e6  # Maximum allowed value of Rsi. Determines method used to calculate Rsi_ohms_estimate.
 
         # Useful values.
         self.f = self.data.frequency.f
@@ -226,12 +242,17 @@ class Inductor():
         full_model = parallel(main_branch_model, parallel_branch_model)
         return full_model
 
-    def get_Cox_Rsi_Csi(self, data=None, optimize=False):
-        '''
+    def get_Cox_Rsi_Csi(self, data=None, optimize=False, fit_method='bffit', debug=False):
+        """
         Gets Cox, Rsi, and Csi from the data. These parameters can be exactly determined.
         :param data: Network object. <scikit-RF Network>
+        :param optimize: For fit_method='lmfit: If True, runs a separate simulataneous optimization Cox, Rsi, and Csi.
+            If False, an optimization is used only to estimate Rsi and Csi. <Bool>
+        :param fit_method: Either brute force fit ('bffit') or least squares ('lmfit'). <str>
+        :param debug: Used only for debug. <Bool>
         :return:
-        '''
+        """
+        print("Getting shunt oxide capacitance and vertical substrate network...")
         # Define data Network.
         if data is None:
             data = self.data
@@ -249,46 +270,95 @@ class Inductor():
         # To get a good polynomial fit, sufficient data points past LF are needed.
         # As a heuristic, we select a frequency (fh) between MF and LF.
         fl = self.lf_limit
-        fl_idx = 0
+        fl_idx = 0 #self.lf_limit_idx
         fh = (self.lf_limit + self.mf)/2
         fh_idx = get_idx_at(fh, self.f)
         y = (1 / Z_Cox_Rsi_Csi.real)[fl_idx:fh_idx]
         x = self.omega[fl_idx:fh_idx]
 
-        # Use np.polyfit to get an intial estimate for c0 and c2. This fit will include c1 term, which should be zero.
+        # Use np.polyfit to get an intial estimate for Rsi and Csi from c[2] and c[0]. Cox is estimated by deembedding Rsi||Csi.
+        # Fit includes c[1] coefficient corresponding to linear dependence on x.
+        # Ideally, c[1] should be zero or a small number and discarded.
         c = np.polyfit(x, y, deg=2)
-
-        # Use lmfit to get more accurate.
-        def poly(omega, c0, c1, c2):
-            return c0*omega**2 + 0*c1*omega + c2
-
-        pmodel = Model(poly)
-        params = pmodel.make_params(c0=c[0], c1=0, c2=c[2])
-        params['c2'].min = 0.1e-6   # Rsi is 1/c2. Set Rsi to some max limit, otherwise optimizer might make this very small, and Csi will be incorrect also.
-        #params['c0'].min = 1e-31    # Related to Csi. Ideally, set to a minimum value, but it messes up lmfit.
-        params['c1'].vary = False
-        result = pmodel.fit(y, params, omega=x)
-        Rsi_ohms_estimate = 1 / result.params['c2']
-        Csi_fF_estimate = 1e15 * math.sqrt(result.params['c0'] / Rsi_ohms_estimate)
-
-        # Estimate Cox. Subtract out Z_Rsi_Csi.
+        Rsi_ohms_estimate = 1 / c[2]
+        Csi_fF_estimate = 1e15 * math.sqrt(c[0] / Rsi_ohms_estimate)
         Z_Csi = 1 / (1j * self.omega * Csi_fF_estimate * 1e-15)
         Z_Rsi_Csi = 1 / (1 / Rsi_ohms_estimate + 1 / Z_Csi)
         Z_Cox = Z_Cox_Rsi_Csi - Z_Rsi_Csi
         Cox = -1e15 / (self.omega * Z_Cox.imag)
         Cox_fF_estimate = Cox[0]
 
-        # If Cox is negative or below a certain value, then it needs to be calculated separately.
-        # This might be the case for SOI where Cox is close to zero and the high resistivity substrate makes Rsi||Csi high impedance.
-        Cox_fF_min = 1e15
-        if Cox_fF_estimate <= Cox_fF_min:
+        # If np.polyfit results in a negative or very small value of Rsi, then the Rsi, Csi, and Cox estimates will be inaccurate.
+        # This might be the case for SOI or high-resistivity substrates.
+        # Redo the estimates using only the lowest frequency value to estimate Cox, Rsi, and Csi.
+        if Rsi_ohms_estimate > self.max_Rsi:
             Cox_fF_estimate = -1e15 / (self.omega[0] * Z_Cox_Rsi_Csi[0].imag)
+            Rsi_ohms_estimate = Z_Cox_Rsi_Csi[0].real
+            Csi_fF_estimate = 1e15 * (np.sqrt((1 / Z_Cox_Rsi_Csi.real - 1 / Rsi_ohms_estimate) / (Rsi_ohms_estimate * self.omega ** 2)))[self.lf_limit_idx]
 
         if self.verbose:
-            print("Estimated Cox_fF, Rsi_ohms, Csi_fF = {}, {}, {}".format(Cox_fF_estimate, Rsi_ohms_estimate, Csi_fF_estimate))
+            print('np.poly fit estimates:')
+            print(' - Cox_fF_estimate =', -1e15 / (self.omega[0] * Z_Cox_Rsi_Csi[0].imag))
+            print(' - Rsi_ohms_estimate =', Z_Cox_Rsi_Csi[0].real)
+            print(' - Csi_fF_estimate =', Csi_fF_estimate)
+
+        # Fit using lmfit or bffit.
+        if fit_method == 'bffit':
+            params = Parameters()
+            params.add('Cox_fF', value=Cox_fF_estimate, min=0.1 * Cox_fF_estimate, max=10 * Cox_fF_estimate, vary=True)
+            params.add('Csi_fF', value=Csi_fF_estimate, min=0.1 * Csi_fF_estimate, max=10 * Csi_fF_estimate, vary=True)
+            params.add('Rsi_ohms', value=Rsi_ohms_estimate, min=0.1 * Rsi_ohms_estimate, max=10 * Rsi_ohms_estimate, vary=True)
+
+            def fit_CRC(params, omega, yknown):
+                Cox = params['Cox_fF'] * 1e-15
+                Csi = params['Csi_fF'] * 1e-15
+                Rsi = params['Rsi_ohms']
+                model = 1 / ((1j * omega * Csi) + 1/Rsi) + 1 / (1j * omega * Cox)
+                error_real = (model.real / yknown.real) - 1
+                error_imag = (model.imag / yknown.imag) - 1
+
+                error_real = np.mean(np.sqrt(error_real ** 2))
+                error_imag = np.mean(np.sqrt(error_imag ** 2))
+
+                error = error_real + error_imag
+                return error
+
+            result = bffit(params, fit_CRC, args=(x, Z_Cox_Rsi_Csi[fl_idx:fh_idx]), logstep=False)
+            Cox_fF_estimate = result['Cox_fF']
+            Rsi_ohms_estimate = result['Rsi_ohms'] # 18e3
+            Csi_fF_estimate = result['Csi_fF']
+
+        elif fit_method == 'lmfit':
+            def poly(omega, c0, c1, c2):
+                return c0 * omega ** 2 + 0 * c1 * omega + c2
+
+            pmodel = Model(poly)
+            params = pmodel.make_params(c0=c[0], c1=0, c2=c[2])
+            params['c2'].min = 0.1e-6   # Rsi is 1/c2. Set Rsi to some max limit, otherwise optimizer might make this very small, and Csi will be incorrect also.
+            #params['c0'].min = 1e-31    # Related to Csi. Ideally, set to a minimum value, but it messes up lmfit.
+            params['c1'].vary = False
+            result = pmodel.fit(y, params, omega=x)
+            Rsi_ohms_estimate = 1 / result.params['c2']
+            Csi_fF_estimate = 1e15 * math.sqrt(result.params['c0'] / Rsi_ohms_estimate)
+
+        else:
+            raise ValueError("fit_method must be either 'lmfit' or 'bffit'.")
+
+        if debug:
+            Zmodel = 1 / ((1j * self.omega * Csi_fF_estimate*1e-15) + 1 / Rsi_ohms_estimate) + 1 / (1j * self.omega * Cox_fF_estimate*1e-15)
+            quickplot(self.f, Z_Cox_Rsi_Csi.real, Zmodel.real, logx=True)
+            quickplot(self.f, Z_Cox_Rsi_Csi.imag, Zmodel.imag, logx=True)
+            plt.show()
+
+        if self.verbose:
+            print("{} estimates:".format(fit_method))
+            print(' - Cox_fF_estimate =', Cox_fF_estimate)
+            print(' - Rsi_ohms_estimate =', Rsi_ohms_estimate)
+            print(' - Csi_fF_estimate =', Csi_fF_estimate)
 
         # Optimize. Needed because real data doesn't follow Cox + Rsi||Csi.
-        if optimize:
+        # Only needed for fit_method='lmfit'. bffit already does optimization for all three variables simultaneously.
+        if optimize and fit_method == 'lmfit':
             params = Parameters()
             params.add('Cox_fF', value=Cox_fF_estimate, min=0.5*Cox_fF_estimate, max=1.5*Cox_fF_estimate, vary=True)
             params.add('Csi_fF', value=Csi_fF_estimate, min=0.5*Csi_fF_estimate, max=1.5*Csi_fF_estimate, vary=True)
@@ -339,46 +409,7 @@ class Inductor():
 
         return error.view()
 
-    def residual_Ls0_Rs0_Ls1_Rs1(self, params=None, Ldc_nH=None, Rdc_ohms=None, f_array=None, data=None):
-        """
-        Residual to do initial estimate of Ls0, Rs0, Ls1, and Rs1.
-        :param params: Parameters used to create the model network (e.g. Ls0, Rs0, Ls1, Rs1). <lmfit Params>
-        :param Rdc: Resistance at DC or very low frequency. <float>
-        :param Ldc: Inductance at DC or very low frequency. <float>
-        :param f_array: Frequency array in Hz. <numpy array>
-        :param data: Data of network to be fitted. <skrf Network>
-        :return:
-        """
-        # Create the model.
-        if data is None:
-            data = self.data
-
-        # Calculate Rs1 and Ls0.
-        Rs0_ohms = params['Rs0_ohms'].value
-        Rs1_ohms = (Rdc_ohms * Rs0_ohms) / (Rs0_ohms - Rdc_ohms)
-        Rt = Rs0_ohms + Rs1_ohms
-        Ls1_nH = params['Ls1_nH'].value
-        Ls0_nH = Ldc_nH - ((Ls1_nH * Rs0_ohms ** 2) / Rt ** 2)
-
-        # Build the inductor.
-        params_series = {}
-        params_series['Rs0_ohms'] = params['Rs0_ohms'].value
-        params_series['Rs1_ohms'] = Rs1_ohms
-        params_series['Ls0_nH'] = Ls0_nH
-        params_series['Ls1_nH'] = params['Ls1_nH'].value
-        main_branch = self.main_branch(params_series)
-        #parallel_branch = self.parallel_branch(params)
-
-        #model = parallel(main_branch, parallel_branch)
-        model = self.main_branch(params_series)
-
-        # Error.
-        error = model.y[:, 0, 1] - data.y[:, 0, 1]
-        error = error.view(np.float)
-
-        return error
-
-    def residual_Cp_Rsub_Csub(self, params=None, f_array=None, data=None):
+    def residual_Cp_Rsub_Csub_old(self, params=None, f_array=None, data=None):
         """
         Residual to determine Cp, Rsub, and Csub.
         :param f_array:
@@ -413,23 +444,91 @@ class Inductor():
 
         return error
 
-    def estimate_Ls0_Rs0_Ls1_Rs1(self, data=None):
+    def residual_Ls0_Rs0_Ls1_Rs1(self, params=None, f_array=None, data=None, Ldc_nH=None, Rdc_ohms=None, fit_method='bffit'):
+        """
+        Residual to do initial estimate of Ls0, Rs0, Ls1, and Rs1.
+        :param params: Parameters used to create the model network (e.g. Ls0, Rs0, Ls1, Rs1). <lmfit Params>
+        :param Rdc: Resistance at DC or very low frequency. <float>
+        :param Ldc: Inductance at DC or very low frequency. <float>
+        :param f_array: Frequency array in Hz. <numpy array>
+        :param data: Data of network to be fitted. <skrf Network>
+        :return:
+        """
+        if data is None:
+            data = self.data
+
+        if Ldc_nH is None:
+            Ldc_nH = self.Ldc_nH
+
+        if Rdc_ohms is None:
+            Rdc_ohms = self.Rdc_ohms
+
+        #print(params, Ldc_nH, Rdc_ohms)
+
+        if fit_method == 'lmfit':
+            # Calculate Rs1 and Ls0.
+            Ls0_nH = params['Ls0_nH'].value
+            Rs0_ohms = params['Rs0_ohms'].value
+            Ls1_nH, Rs1_ohms = self.calculate_Ls1_Rs1(Ls0_nH, Rs0_ohms, Ldc_nH, Rdc_ohms)
+
+            # Build the inductor.
+            params_series = {}
+            params_series['Ls0_nH'] = params['Ls0_nH'].value
+            params_series['Rs0_ohms'] = params['Rs0_ohms'].value
+            params_series['Ls1_nH'] = Ls1_nH
+            params_series['Rs1_ohms'] = Rs1_ohms
+            model = self.main_branch(params_series)
+
+            # Error is an array.
+            y12_model = model.y[:, 0, 1]
+            y12_data = data.y[:, 0, 1]
+            error = y12_model - y12_data # These are lines, so use minus and not divide.
+            error = error.view(np.float)
+
+        elif fit_method == 'bffit':
+            # Calculate Rs1 and Ls0.
+            Ls0_nH = params['Ls0_nH']
+            Rs0_ohms = params['Rs0_ohms']
+            Ls1_nH, Rs1_ohms = self.calculate_Ls1_Rs1(Ls0_nH, Rs0_ohms, Ldc_nH, Rdc_ohms)
+
+            # Build the inductor.
+            params_series = {}
+            params_series['Ls0_nH'] = params['Ls0_nH']
+            params_series['Rs0_ohms'] = params['Rs0_ohms']
+            params_series['Ls1_nH'] = Ls1_nH
+            params_series['Rs1_ohms'] = Rs1_ohms
+            model = self.main_branch(params_series)
+
+            # Error is a float.
+            y12_model = model.y[:, 0, 1]
+            y12_data = data.y[:, 0, 1]
+            error_real = (y12_model.real / y12_data.real) - 1
+            error_imag = (y12_model.imag / y12_data.imag) - 1
+            error_real = np.mean(np.sqrt(error_real ** 2))
+            error_imag = np.mean(np.sqrt(error_imag ** 2))
+            error = error_real + error_imag
+
+        return error
+
+    def estimate_Ls0_Rs0_Ls1_Rs1(self, data=None, optimize=True, fit_method='bffit'):
         '''
         Estimates Ls0, Rs0, Ls1, Rs1.
         It is an estimate because the parasitive capacitive branches are unknown and assumed to be open at low frequencies.
         :param data: Network object. <scikit-RF Network>
         :return: Ls0, Rs0, Ls1, Rs1
         '''
+        print("Getting series inductance and resistance...")
         # Define data Network.
         if data is None:
             data = self.data
 
         # Isolate the series path. This includes the LR path and the Cox+(Rsub||Csb)+Cox path and the Cp path.
         # For initial estimate, assume L-R path is dominant at low frequencies.
+        fh_idx = self.lf_limit_idx
         Y12_data = data.y[:, 0, 1]
-        Y12_data = Y12_data[0:self.lf_limit_idx]
+        Y12_data = Y12_data[0:fh_idx]
         Ru = (-1 / Y12_data).real
-        Lu = (-1 / Y12_data).imag / self.omega[0:self.lf_limit_idx]
+        Lu = (-1 / Y12_data).imag / self.omega[0:fh_idx]
 
         # DC series resistance and inductance. Use lowest frequency data point.
         Rdc = Ru[0]
@@ -443,7 +542,7 @@ class Inductor():
         bestfit_slope, _, _, _ = np.linalg.lstsq(x[:, np.newaxis], y, rcond=None)    # Force y-intercept to 0.
         T = bestfit_slope[0]
 
-        x2 = 1 / (1 + (T ** 2) / (self.omega[0:self.lf_limit_idx]) ** 2)
+        x2 = 1 / (1 + (T ** 2) / (self.omega[0:fh_idx]) ** 2)
         M, b = np.polyfit(x2, y, 1)
 
         # Estimate parameters.
@@ -451,47 +550,84 @@ class Inductor():
         Rs1_ohms_est = (Rs0_ohms_est * Rdc) / M
         Ls0_nH_est = 1e9 * (Ldc - M / T)
         Ls1_nH_est = 1e9 * (Rs0_ohms_est + Rs1_ohms_est) / T
+        fitted_params = {'Ls0_nH': Ls0_nH_est, 'Rs0_ohms': Rs0_ohms_est, 'Ls1_nH': Ls1_nH_est, 'Rs1_ohms': Rs1_ohms_est}
         if self.verbose:
-            print("Estimated: Ls0_est={}, Rs0_est={}, Ls1_est={}, Rs1_est={}, Ldc={}, Rdc={}".format(Ls0_nH_est, Rs0_ohms_est, Ls1_nH_est, Rs1_ohms_est, Ldc, Rdc))
+            print("Estimated:", fitted_params)
 
         # Optimize. Rs1 and Ls0 are calculated in the residual from Rs1 and Ls0.
-        params = Parameters()
-        params.add('Rs0_ohms', value=Rs0_ohms_est, min=0, max=20, vary=True)
-        # params.add('Rs1_ohms', value=12, min=0, max=20, vary=False)
-        # params.add('Ls0_nH', value=9, min=0, max=20, vary=False)
-        params.add('Ls1_nH', value=Ls1_nH_est, min=0, max=20, vary=True)
-        out = minimize(self.residual_Ls0_Rs0_Ls1_Rs1, params, args=(self.f, Ldc_nH, Rdc_ohms, self.data))
+        if optimize and fit_method == 'lmfit':
+            params = Parameters()
+            params.add('Ls0_nH', value=Ls0_nH_est, min=0.5*Ls1_nH_est, max=Ldc_nH-0.01, vary=True)
+            params.add('Rs0_ohms', value=Rs0_ohms_est, min=Rdc_ohms+0.01, max=1.5*Rs0_ohms_est, vary=True)    # Rs0 needs to be at least a little larger than Rdc in this model.
+            # params.add('Ls1_nH', value=Ls1_nH_est, min=0, max=20, vary=False)
+            # params.add('Rs1_ohms', value=12, min=0, max=20, vary=False)
+            out = minimize(self.residual_Ls0_Rs0_Ls1_Rs1, params, args=(self.f, self.data, Ldc_nH, Rdc_ohms, fit_method))
+            Ls0_nH = out.params['Ls0_nH'].value
+            Rs0_ohms = out.params['Rs0_ohms'].value
+            Ls1_nH, Rs1_ohms = self.calculate_Ls1_Rs1(Ls0_nH, Rs0_ohms, Ldc_nH, Rdc_ohms)
+            fitted_params = {'Ls0_nH': Ls0_nH, 'Rs0_ohms': Rs0_ohms, 'Ls1_nH': Ls1_nH, 'Rs1_ohms': Rs1_ohms}
 
-        # Build the model and check.
-        # Calculate Rs1_ohms and Ls0_ohms from fitted/known values of Rs0_ohms, Ls0_ohms, Rdc_ohms, and Ldc_nH.
-
-        Rs0_ohms = params['Rs0_ohms'].value
-        Rs1_ohms = (Rdc_ohms * Rs0_ohms) / (Rs0_ohms - Rdc_ohms)
-        Rt = Rs0_ohms + Rs1_ohms
-        Ls1_nH = params['Ls1_nH'].value
-        Ls0_nH = Ldc_nH - ((Ls1_nH * Rs0_ohms ** 2) / Rt ** 2)
-
-        out.params.add('Rs1_ohms', value=Rs1_ohms, vary=False)
-        out.params.add('Ls0_nH', value=Ls0_nH, vary=False)
+        elif optimize and fit_method == 'bffit':
+            params = Parameters()
+            params.add('Ls0_nH', value=Ls0_nH_est, min=0.5*Ldc_nH, max=Ldc_nH-0.01, vary=True)
+            params.add('Rs0_ohms', value=Rs0_ohms_est, min=Rdc_ohms+0.01, max=2*Rs0_ohms_est, vary=True)    # Rs0 needs to be at least a little larger than Rdc in this model.
+            # params.add('Ls1_nH', value=Ls1_nH_est, min=0, max=20, vary=False)
+            # params.add('Rs1_ohms', value=12, min=0, max=20, vary=False)
+            out = bffit(params, self.residual_Ls0_Rs0_Ls1_Rs1, args=(self.f, self.data, Ldc_nH, Rdc_ohms, fit_method), steps=50)
+            Ls0_nH = out['Ls0_nH']
+            Rs0_ohms = out['Rs0_ohms']
+            Ls1_nH, Rs1_ohms = self.calculate_Ls1_Rs1(Ls0_nH, Rs0_ohms, Ldc_nH, Rdc_ohms)
+            fitted_params = {'Ls0_nH': Ls0_nH, 'Rs0_ohms': Rs0_ohms, 'Ls1_nH': Ls1_nH, 'Rs1_ohms': Rs1_ohms}
 
         if self.verbose:
-            print("Optimized: Ls0_nH_est={}, Rs0_ohms_est={}, Ls1_nH_est={}, Rs1_ohms_est={}".format(out.params['Ls0_nH'].value, out.params['Rs0_ohms'].value, out.params['Ls1_nH'].value, out.params['Rs1_ohms'].value))
+            print("Fitted series parameters:", fitted_params)
 
-        # Return the parameters as a simple dictionary.
-        params = {}
-        for param in out.params:
-            params[param] = out.params[param].value
+        return fitted_params
 
-        return params
+    def residual_Cp_Rsub_Csub(self, params=None, f_array=None, data=None):
+        """
+        Residual to determine Cp, Rsub, and Csub.
+        Fits up to the "series" SRF, which is higher than the "in" SRF.
+        :param f_array:
+        :param Ls_nH:
+        :param Rs_ohms:
+        :return:
+        """
+        # Create the model.
+        # Copy the lmfit params to a simple dictionary.
+        parameters2 = {}
+        parameters2['Rs0_ohms'] = params['Rs0_ohms'].value
+        parameters2['Rs1_ohms'] = params['Rs1_ohms'].value
+        parameters2['Ls0_nH'] = params['Ls0_nH'].value
+        parameters2['Ls1_nH'] = params['Ls1_nH'].value
+        parameters2['Cox_fF'] = params['Cox_fF'].value
+        parameters2['Csi_fF'] = params['Csi_fF'].value
+        parameters2['Rsi_ohms'] = params['Rsi_ohms'].value
+        parameters2['Cp_fF'] = params['Cp_fF'].value
+        parameters2['Rsub_ohms'], parameters2['Csub_fF'] = self.calculate_Rsub_Csub(parameters2['Cp_fF'])
+
+        # Build the model.
+        main_branch = self.main_branch(parameters2)
+        parallel_branch = self.parallel_branch(parameters2)
+        model = parallel(main_branch, parallel_branch)
+
+        # Error. Minimize the excess capacitance by increasing Cp and/or Csub.
+        Yseries_data = data.y[:, 0, 1]
+        Yseries_model = model.y[:, 0, 1]
+        Y_Rsub_Csub_Cp = Yseries_model - Yseries_data  # "data" has more parasitic cap than "model", so admittance Ycap,model > Ycap,data
+        excess_cap = 1e15 * Y_Rsub_Csub_Cp.imag / self.omega
+        error = excess_cap[self.lf_limit_idx:self.srf_series_idx]
+
+        return error
 
     def estimate_Cp_Rsub_Csub(self, known_params, main_branch_params, data=None):
         '''
-        Once the main branch parameters are known, then these parameters can be extracted by
-        subtracting the main branch parameters from Y12 (or Y21).
+        Fit the Cp, Rsub, and Csub. Use the mid-frequency to estimate.
         :param main_branch_params: Network parameters of main LR branch of fitted data. <dict>
         :param data: Network parameters of data to be fitted. <scikit-RF Network>
         :return:
         '''
+        print("Getting parallel capacitance and lateral substrate network...")
         # Define data network.
         if data is None:
             data = self.data
@@ -508,20 +644,24 @@ class Inductor():
         excess_admittance = Y_Rsub_Csub_Cp  # Gives Rsub||Csub||Cp.
         excess_cap = excess_admittance.imag / self.omega
         # excess_res = -1 / excess_admittance.real    # Doesn't give good results because estimated main branch parameters are not fully accurate.
+        excess_cap_at_mf = 1e15 * excess_cap[self.mf_idx]
+        Cp_fF_estimate = excess_cap_at_mf
 
         # Excess cap > 0, otherwise that means there is no further capacitance to add to the model.
         # Return a small Cp and Csub value and large value of Rsub just to build model without any impact on electricals.
-        if np.any(excess_cap[self.lf_limit_idx:self.srf_series_idx] < 0):
-            if self.verbose: print('No excess cap found. Setting minimum values for Cp_fF, Rsub_ohms, and Csub_fF.')
-            Cp_fF_estimate = 1e-6
-            Csub_fF_estimate = 1e-6
+        # if np.any(excess_cap[self.lf_limit_idx:self.srf_series_idx] < 0):
+        if excess_cap_at_mf < 0:
+            if self.verbose:
+                print('No excess cap found. Setting minimum values for Cp_fF, Rsub_ohms, and Csub_fF.')
+            Cp_fF_estimate = 0.1
+            Csub_fF_estimate = 0.001
             Rsub_ohms_estimate = 1e9
 
         else:
             # Estimate the excess cap.
             # This excess cap models the SRF so it is useful to choose a frequency between LF and SRF.
-            excess_cap_at_mf = 1e15 * excess_cap[self.mf_idx]
-            if self.verbose: print('Excess cap =', excess_cap_at_mf)
+            if self.verbose:
+                print('Excess cap =', excess_cap_at_mf)
 
             # Optimize. Use the excess cap as an estimate to Cp. Rsub and Csub are calculated.
             params = Parameters()
@@ -529,9 +669,9 @@ class Inductor():
                 params.add(param_name, value=main_branch_params[param_name], vary=False)
             for param_name in known_params:
                 params.add(param_name, value=known_params[param_name], vary=False)
-            params.add('Cp_fF', value=excess_cap_at_mf, min=0.5*excess_cap_at_mf, max=1.5*excess_cap_at_mf, vary=True)
-            #params.add('Csub_fF', value=0.1, vary=False)  # Set to some low value. Will be estimated later.
-            #params.add('Rsub_ohms', value=10000, vary=False)  # Set to some high value. Will be estimated later.
+            params.add('Cp_fF', value=Cp_fF_estimate, min=0.5*excess_cap_at_mf, max=1.5*excess_cap_at_mf, vary=True)
+            # params.add('Csub_fF', value=0.1, vary=False)  # Calculated by epsilon ratio.
+            # params.add('Rsub_ohms', value=10000, vary=False)  # Calculated assuming Rsi*Csi = Rsub*Csub.
             out = minimize(self.residual_Cp_Rsub_Csub, params, args=(self.f, self.data))
 
             # Estimate Csub by using dielectric ratio of Si vs SiO2.
@@ -600,6 +740,7 @@ class Inductor():
         :param data: Network parameters of data to be fitted. <scikit-RF Network>
         :return: Optimized parameters
         """
+        print("Full model optimization...")
         # Build the model.
         # 'Ls1_nH', 'Rs1_nH', 'Rsub_ohms', 'Csub_fF' are dependent parameters and calculated.
         params = Parameters()
@@ -637,15 +778,23 @@ class Inductor():
 
         return fully_fitted_params
 
-    def calculate_Ls1_Rs1(self, Ls0_nH, Rs0_ohms):
+    def calculate_Ls1_Rs1(self, Ls0_nH, Rs0_ohms, Ldc_nH=None, Rdc_ohms=None):
         """
         Given Ls0_nH and Rs0_ohms, Ls1_nH and Rs1_ohms can be calculated.
-        :param Ls1_nH:
-        :param Rs0_ohms:
-        :param Ldc_nH:
-        :param Rdc_ohms:
-        :return:
+        :param Ls0_nH: Ls0 in nH. <float>
+        :param Rs0_ohms: Rs0 in ohms. <float>
+        :param Ldc_nH: Estimated inductance at DC. <float>
+        :param Rdc_ohms: Estimated resistance at DC. <float>
+        :return: Ls1_nH, Rs1_nH
         """
+        # Get Ldc_nH and Rdc_nH if they are not defined.
+        if Ldc_nH is None:
+            Ldc_nH = self.Ldc_nH
+
+        if Rdc_ohms is None:
+            Rdc_ohms = self.Rdc_ohms
+
+        # Error check.
         if Rs0_ohms < self.Rdc_ohms:
             raise ValueError("Rs0_ohms ({}) is less than Rdc_ohms ({}). Would result in negative Rs1_ohms.".format(Rs0_ohms, self.Rdc_ohms))
 
@@ -702,7 +851,6 @@ class Inductor():
         with open(path, mode='w') as fid:
             fid.write(text)
 
-
     def show_plot(self, save=True):
         """
         Shows a plot of the inductor model vs data.
@@ -712,5 +860,3 @@ class Inductor():
         plotLR(self.data, self.model, plot_type='series', filename="./{}_fit_series.png".format(self.name))
         plotLR(self.data, self.model, plot_type='in', filename="./{}_fit_in.png".format(self.name))
         plt.show()
-
-
