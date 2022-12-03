@@ -6,19 +6,6 @@ import time
 #from scikit_learn.metrics import r2_score
 
 """
-Status 11/30/2022: 
-    [70%] Fix get_Cox_Rsi_Csi. Use 3-variable brute force fit. Ideal fit doesn't work for real inductors.
-        bffit works better for linear step
-    [0%] Fix get_Cox_Rsi_Csi to find better (higher) value for Rsi. Z_Cox_Rsi_Csi is not matching well at lowest frequency. 
-        May be model limitation.
-    [100%] Fix bffit so that the n best combos have different min/max for each parameter. Right now, it's possible that one parameter doesn't 
-        in the best_combos is constant.
-    [0%] Add ability to handle "vary=False" in bffit.
-    [0%] Change the real + imaginary fit residuals to be % optimizations (not -).
-    [0%] Get the single-turn inductor to fit properly. --> Can't resistance rise is too rapid. Need a different model.
-    [0%] Change Cp optimization to fit SRF. --> No. Estimates at MF and optimizies up to series SRF.
-    [0%] Change Ls0_Rs0_Ls1_Rs1 to use bffit.
-
 Inductor class.
  - Holds the data to be fitted as Network object
  - Creates a fitted Network object
